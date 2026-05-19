@@ -1,0 +1,90 @@
+{
+  "total_examples": 3159,
+  "exact_match_strict": {
+    "count": 2999,
+    "rate": 0.9493510604621715
+  },
+  "exact_match_strict_stripped": {
+    "count": 2999,
+    "rate": 0.9493510604621715
+  },
+  "token_exact_match": {
+    "count": 2999,
+    "rate": 0.9493510604621715
+  },
+  "char_length_match": {
+    "count": 3032,
+    "rate": 0.9597974042418487
+  },
+  "token_length_match": {
+    "count": 3068,
+    "rate": 0.9711934156378601
+  },
+  "mismatch_sample_count": 10,
+  "mismatches": [
+    {
+      "index": 0,
+      "ref": "How are you? Where are you from?",
+      "pred": "How are you? Where did you come from?"
+    },
+    {
+      "index": 13,
+      "ref": "I tasted the food. It's good.",
+      "pred": "I have made some tips. This is good."
+    },
+    {
+      "index": 17,
+      "ref": "Thank you for helping me.",
+      "pred": "Thanks for helping me."
+    },
+    {
+      "index": 20,
+      "ref": "I want to learn to cook Nepali food.",
+      "pred": "I want to learn cooking Nepali food."
+    },
+    {
+      "index": 21,
+      "ref": "What kind of things can I find here?",
+      "pred": "What kind of items can you find here?"
+    },
+    {
+      "index": 22,
+      "ref": "Can you show me the Durbar?",
+      "pred": "Can you show me the palace?"
+    },
+    {
+      "index": 27,
+      "ref": "I want to learn to trek.",
+      "pred": "I want to learn to do ching."
+    },
+    {
+      "index": 29,
+      "ref": "Hello! How is business?",
+      "pred": "How's the meeting? Is business okay?"
+    },
+    {
+      "index": 30,
+      "ref": "I brought new goods.",
+      "pred": "I have brought new items."
+    },
+    {
+      "index": 31,
+      "ref": "This is such good quality.",
+      "pred": "This is such a nice item."
+    }
+  ],
+  "note": "Strict metrics enforce case, punctuation, token order, and lengths.",
+  "BLEU": {
+    "score": 97.62392263417512
+  },
+  "chrF": {
+    "score": 98.32184490461606
+  },
+  "meta": {
+    "checkpoint": "checkpoints\\translation_model",
+    "device": "cuda",
+    "batch_size": 8,
+    "max_length": 128,
+    "tgt_lang": null
+  }
+}
