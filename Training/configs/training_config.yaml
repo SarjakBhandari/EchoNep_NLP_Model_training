@@ -1,0 +1,23 @@
+project_name: local_np_en_translator
+
+data:
+  data_dir: data
+
+training:
+  output_dir: checkpoints/translation_model
+  base_model: facebook/nllb-200-distilled-600M
+  max_source_length: 160
+  max_target_length: 160
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_train_epochs: 4
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.08
+  max_grad_norm: 1.0
+  save_total_limit: 3
+  early_stopping_patience: 2
+  cpu_threads: 12
+  dataloader_workers: 8
+  logging_steps: 20
+  gradient_checkpointing: true
