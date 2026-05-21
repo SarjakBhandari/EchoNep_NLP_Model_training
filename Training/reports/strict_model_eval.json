@@ -1,0 +1,90 @@
+{
+  "total_examples": 3160,
+  "exact_match_strict": {
+    "count": 0,
+    "rate": 0.0
+  },
+  "exact_match_strict_stripped": {
+    "count": 0,
+    "rate": 0.0
+  },
+  "token_exact_match": {
+    "count": 0,
+    "rate": 0.0
+  },
+  "char_length_match": {
+    "count": 187,
+    "rate": 0.05917721518987342
+  },
+  "token_length_match": {
+    "count": 965,
+    "rate": 0.30537974683544306
+  },
+  "mismatch_sample_count": 10,
+  "mismatches": [
+    {
+      "index": 0,
+      "ref": "﻿\"नमस्ते, मेरो नाम राज हो।\"",
+      "pred": "\" Hello, my name is Raj. \""
+    },
+    {
+      "index": 1,
+      "ref": "कस्तो छ? तिमी कहाँ देखि आएछौ?",
+      "pred": "How are you? Where are you from?"
+    },
+    {
+      "index": 2,
+      "ref": "मैले भारत देशबाट आएको हुँ।",
+      "pred": "I came from India."
+    },
+    {
+      "index": 3,
+      "ref": "नेपाल कति सुन्दर छ!",
+      "pred": "Nepal is so beautiful!"
+    },
+    {
+      "index": 4,
+      "ref": "यो पहिलो पटक नेपाल आएको हुँ।",
+      "pred": "This is my first time in Nepal."
+    },
+    {
+      "index": 5,
+      "ref": "काठमाडौं कति दूर छ?",
+      "pred": "How far is Kathmandu?"
+    },
+    {
+      "index": 6,
+      "ref": "यहाँ कुन होटेल राम्रो छ?",
+      "pred": "Which hotel is good here?"
+    },
+    {
+      "index": 7,
+      "ref": "मैले पोखरा घुमना चाहन्छु।",
+      "pred": "I want to visit Pokhara."
+    },
+    {
+      "index": 8,
+      "ref": "यहाँ तस्वीर खिच्न दिइन्छ?",
+      "pred": "Is it allowed to take photos here?"
+    },
+    {
+      "index": 9,
+      "ref": "यो स्थान कति पुरानो छ?",
+      "pred": "How old is this place?"
+    }
+  ],
+  "note": "Strict metrics enforce case, punctuation, token order, and lengths.",
+  "BLEU": {
+    "score": 0.165438214302972
+  },
+  "chrF": {
+    "score": 5.274549736316975
+  },
+  "meta": {
+    "checkpoint": "checkpoints\\translation_model",
+    "device": "cuda",
+    "batch_size": 8,
+    "max_length": 128,
+    "tgt_lang": null
+  }
+}

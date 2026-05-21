@@ -1,0 +1,6 @@
+**/models/
+**/__pycache__/
+**/venv/
+**/dart_tools
+**/processed/
+**/checkpoints/
