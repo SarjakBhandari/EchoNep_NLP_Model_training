@@ -1,22 +1,13 @@
-datasets==2.19.0
-pandas==2.2.2
-pyyaml==6.0.1
-sentencepiece==0.2.0
-torch==2.2.0
-transformers==4.44.0
-sacrebleu==2.4.2
-tqdm==4.66.4
-huggingface_hub==0.23.2
+accelerate==1.13.0
+datasets==4.8.5
+huggingface_hub==1.15.0
+pandas==2.3.3
+PyYAML==6.0.3
+sacrebleu==2.6.0
+sentencepiece==0.2.1
+torch==2.5.1+cu121
+tqdm==4.67.3
+transformers==5.8.1
 
-# GPU / CUDA support
-nvidia-pyindex==1.0.9
-nvidia-pip==23.9
-nvidia-nvjitlink-cu12==12.4.99
-nvidia-pytorch-cu12==2.2.0
-nvidia-torchtriton-cu12==2.2.0
-nvidia-nccl-cu12==2.20.5
-nvidia-cublas-cu12==12.4.5.8
-nvidia-cuda-runtime-cu12==12.4.127
-nvidia-cuda-nvrtc-cu12==12.4.127
-nvidia-cuda-cupti-cu12==12.4.127
-nvidia-cudnn-cu12==9.1.0.70
+# CUDA 12.1 wheels are served from the PyTorch index.
+--extra-index-url https://download.pytorch.org/whl/cu121
