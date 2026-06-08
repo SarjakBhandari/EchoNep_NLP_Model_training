@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 import argparse, json, logging, math
 from pathlib import Path
+import re
 from typing import Dict, List
 
 import torch
@@ -37,6 +38,21 @@ def read_tsv(path: Path):
     df = pd.read_csv(path, sep="\t", header=0)
     srcs = df.iloc[:,0].astype(str).tolist()
     refs = df.iloc[:,1].astype(str).tolist()
+    # Auto-detect common Nepali (Devanagari) vs English column order and
+    # swap columns if they appear reversed. Many test files use (Nepali,English)
+    # but older evaluation expected (English,Nepali).
+    def looks_like_devanagari(s: str) -> bool:
+        return bool(re.search(r"[\u0900-\u097F]", s))
+
+    # Inspect a sample of rows to decide if columns are reversed
+    sample_n = min(100, max(1, len(srcs)))
+    src_dev = sum(1 for s in srcs[:sample_n] if looks_like_devanagari(s))
+    ref_dev = sum(1 for r in refs[:sample_n] if looks_like_devanagari(r))
+    # If first column looks predominantly Devanagari and second column not,
+    # assume the file is (Nepali,English) and swap so src=English, ref=Nepali
+    if src_dev > ref_dev and src_dev > sample_n // 2:
+        logger.info("Detected Devanagari (Nepali) in first column; swapping source/reference columns.")
+        srcs, refs = refs, srcs
     return srcs, refs
 
 def token_equal(a: str, b: str) -> bool:
@@ -83,6 +99,15 @@ def save_json(path: Path, data: Dict) -> None:
     tmp.replace(path)
     logger.info("Saved report to %s", path)
 
+def save_predictions(path: Path, sources: List[str], refs: List[str], preds: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open('w', encoding='utf-8') as fh:
+        for s, r, p in zip(sources, refs, preds):
+            fh.write(json.dumps({"source": s, "reference": r, "prediction": p}, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    logger.info("Saved predictions to %s", path)
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Translation evaluation using a model checkpoint and TSV files.")
     p.add_argument("--checkpoint", type=Path, required=True)
@@ -124,14 +149,19 @@ def main() -> int:
     # Official metrics
     bleu = sacrebleu.corpus_bleu(preds, [refs])
     chrf = sacrebleu.corpus_chrf(preds, [refs])
+    ter = sacrebleu.corpus_ter(preds, [refs])
     report["BLEU"] = {"score": bleu.score}
     report["chrF"] = {"score": chrf.score}
+    report["TER"] = {"score": ter.score}
 
     report["meta"] = {"checkpoint": str(args.checkpoint), "device": str(device),
                       "batch_size": args.batch_size, "max_length": args.max_length,
                       "tgt_lang": args.tgt_lang}
 
     save_json(args.out, report)
+    # save per-sample predictions for analysis
+    preds_path = Path(str(args.out)).with_name('predictions.jsonl')
+    save_predictions(preds_path, srcs, refs, preds)
 
     # Print concise summary
     summary = {

@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+import numpy as np
 import torch
 import yaml
 from datasets import Dataset
@@ -25,12 +26,14 @@ from transformers import (
 )
 from transformers import set_seed
 
+import sacrebleu
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "training_config.yaml"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "checkpoints" / "translation_model"
-DEFAULT_BASE_MODEL = "../models/nllb"
+DEFAULT_BASE_MODEL = str(PROJECT_ROOT / "models" / "nllb")
 
 LANGUAGE_MAP = {
     "en": "eng_Latn",
@@ -59,6 +62,11 @@ def load_config(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     return data or {}
+
+
+def resolve_project_path(value: Any, default: Path) -> Path:
+    path = Path(value) if value is not None else default
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def normalize_text(text: str) -> str:
@@ -413,6 +421,34 @@ def train_model(
 
     has_validation = valid_tokenized is not None and len(valid_tokenized) > 0
 
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+
+        decoded_predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        exact_matches = 0
+        token_overlap_total = 0.0
+        for prediction, reference in zip(decoded_predictions, decoded_labels):
+            if prediction.strip() == reference.strip():
+                exact_matches += 1
+
+            reference_tokens = set(reference.split())
+            prediction_tokens = set(prediction.split())
+            if reference_tokens:
+                token_overlap_total += len(reference_tokens & prediction_tokens) / len(reference_tokens)
+
+        sample_count = max(1, len(decoded_labels))
+        bleu_score = sacrebleu.corpus_bleu(decoded_predictions, [decoded_labels]).score if decoded_labels else 0.0
+        return {
+            "exact_match_accuracy": exact_matches / sample_count,
+            "token_overlap_accuracy": token_overlap_total / sample_count,
+            "bleu": bleu_score,
+        }
+
     try:
         train_samples = len(train_tokenized)
     except Exception:
@@ -437,12 +473,14 @@ def train_model(
         logging_steps=logging_steps,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=torch.cuda.is_available(),
-        label_smoothing_factor=label_smoothing_factor,
+        # This model fails when Trainer strips labels and runs an unlabeled
+        # forward pass, so keep the model's built-in seq2seq loss path.
+        label_smoothing_factor=0.0,
         predict_with_generate=True,
         generation_max_length=max_target_length,
         load_best_model_at_end=has_validation,
-        metric_for_best_model="eval_loss" if has_validation else None,
-        greater_is_better=False,
+        metric_for_best_model="token_overlap_accuracy" if has_validation else None,
+        greater_is_better=has_validation,
         fp16=torch.cuda.is_available(),
         gradient_checkpointing=True,
         report_to="none",
@@ -457,6 +495,7 @@ def train_model(
         # Avoid injecting decoder_input_ids in the collator; this prevents
         # decoder_input_ids/decoder_inputs_embeds conflicts in some builds.
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+        compute_metrics=compute_metrics if has_validation else None,
         callbacks=(
             [EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
             if has_validation else []
@@ -468,6 +507,8 @@ def train_model(
     print(f"CPU threads: {cpu_threads} | Grad accumulation: {grad_accum}")
     print(f"GPU available: {torch.cuda.is_available()}")
     print(f"Steps/epoch: {steps_per_epoch} | Total steps: {total_train_steps}")
+    if has_validation:
+        print("Validation metrics are computed at the end of every epoch.")
     print(f"Starting fine-tuning for {num_train_epochs} epochs ...")
     trainer.train()
 
@@ -509,10 +550,16 @@ def main() -> None:
     config       = load_config(Path(args.config))
     data_cfg     = config.get("data", {})
     training_cfg = config.get("training", {})
-
-    data_dir   = Path(args.data_dir   or data_cfg.get("data_dir",   DEFAULT_DATA_DIR))
-    output_dir = Path(args.output_dir or training_cfg.get("output_dir", DEFAULT_OUTPUT_DIR))
-    base_model = args.base_model      or training_cfg.get("base_model", DEFAULT_BASE_MODEL)
+    print(PROJECT_ROOT)
+    data_dir = resolve_project_path(
+        args.data_dir or data_cfg.get("data_dir"),
+        DEFAULT_DATA_DIR,
+    )
+    output_dir = resolve_project_path(
+        args.output_dir or training_cfg.get("output_dir"),
+        DEFAULT_OUTPUT_DIR,
+    )
+    base_model = args.base_model or training_cfg.get("base_model", DEFAULT_BASE_MODEL)
     max_source_length = int(training_cfg.get("max_source_length", 160))
     max_target_length = int(training_cfg.get("max_target_length", 160))
     validation_split = float(training_cfg.get("validation_split", 0.1))
