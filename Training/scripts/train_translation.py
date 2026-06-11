@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import random
@@ -23,17 +22,17 @@ from transformers import (
     EarlyStoppingCallback,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    set_seed,
 )
-from transformers import set_seed
-
 import sacrebleu
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "training_config.yaml"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "checkpoints" / "translation_model"
 DEFAULT_BASE_MODEL = str(PROJECT_ROOT / "models" / "nllb")
+
+# ── language helpers ───────────────────────────────────────────────────────────
 
 LANGUAGE_MAP = {
     "en": "eng_Latn",
@@ -45,6 +44,8 @@ LANGUAGE_MAP = {
     "nepali": "npi_Deva",
 }
 
+ALLOWED_NLLB_CODES = {"eng_Latn", "npi_Deva"}
+
 HEADER_SOURCE_NAMES = {
     "source", "source_text", "text_a", "input", "english", "en", "from",
 }
@@ -52,15 +53,18 @@ HEADER_TARGET_NAMES = {
     "target", "target_text", "text_b", "output", "nepali", "ne", "to",
 }
 HEADER_KEYWORDS = HEADER_SOURCE_NAMES | HEADER_TARGET_NAMES | {"category", "lang", "language"}
+
 DEVANAGARI_PATTERN = re.compile(r"[\u0900-\u097F]")
 LATIN_PATTERN = re.compile(r"[A-Za-z]")
 
 
+# ── config ─────────────────────────────────────────────────────────────────────
+
 def load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
     return data or {}
 
 
@@ -68,6 +72,8 @@ def resolve_project_path(value: Any, default: Path) -> Path:
     path = Path(value) if value is not None else default
     return path if path.is_absolute() else PROJECT_ROOT / path
 
+
+# ── text utilities ─────────────────────────────────────────────────────────────
 
 def normalize_text(text: str) -> str:
     value = unicodedata.normalize("NFKC", str(text))
@@ -90,7 +96,7 @@ def guess_language(text: str) -> Optional[str]:
         return "ne"
     if latin >= max(devanagari * 2, 2):
         return "en"
-    return None
+    return None  # mixed / ambiguous — reject
 
 
 def canonical_lang_code(lang: str) -> str:
@@ -101,9 +107,11 @@ def ensure_lang_code(lang: str) -> str:
     return canonical_lang_code(lang)
 
 
-def should_skip_pair(source_text: str, target_text: str) -> bool:
-    return not (source_text and target_text)
+def is_allowed_lang(code: str) -> bool:
+    return canonical_lang_code(code) in ALLOWED_NLLB_CODES
 
+
+# ── file discovery ─────────────────────────────────────────────────────────────
 
 def iter_tabular_files(data_dir: Path, include_hidden: bool = False) -> Iterator[Path]:
     excluded_dirs = {"external", "processed", "raw", "checkpoints", "venv", ".git"}
@@ -149,16 +157,21 @@ def choose_header_columns(header: Sequence[str]) -> Tuple[int, int]:
     return source_index, target_index
 
 
+# ── data loading ───────────────────────────────────────────────────────────────
+
 def read_tabular_file(path: Path) -> Iterable[Dict[str, Any]]:
-    with path.open("r", encoding="utf-8-sig") as handle:
-        lines = handle.readlines()
+    """
+    Read a TSV/CSV file and emit *bidirectional* translation pairs.
+    """
+    with path.open("r", encoding="utf-8-sig") as fh:
+        lines = fh.readlines()
 
     if not lines:
-        return []
+        return
 
     start_index = 0
-    first_line = lines[0].strip().split("\t")
-    if looks_like_header(first_line):
+    first_line_parts = lines[0].strip().split("\t")
+    if looks_like_header(first_line_parts):
         start_index = 1
 
     for line in lines[start_index:]:
@@ -168,16 +181,48 @@ def read_tabular_file(path: Path) -> Iterable[Dict[str, Any]]:
         parts = line.split("\t")
         if len(parts) < 2:
             continue
-        source_text = normalize_text(parts[0])
-        target_text = normalize_text(parts[1])
-        if not source_text or not target_text:
+
+        col0 = normalize_text(parts[0])
+        col1 = normalize_text(parts[1])
+        if not col0 or not col1:
             continue
+
+        lang0 = guess_language(col0)
+        lang1 = guess_language(col1)
+
+        # Reject rows where language cannot be determined or is not EN/NE
+        if lang0 not in ("en", "ne") or lang1 not in ("en", "ne"):
+            continue
+        # Both columns must be different languages
+        if lang0 == lang1:
+            continue
+
+        # Normalise so en_text is always English, ne_text is always Nepali
+        if lang0 == "en":
+            en_text, ne_text = col0, col1
+        else:
+            en_text, ne_text = col1, col0
+
+        base = {"source_file": path.name}
+
+        # EN → NE
         yield {
-            "source_text": source_text,
-            "target_text": target_text,
+            **base,
+            "source_text": en_text,
+            "target_text": ne_text,
             "source_lang": "en",
             "target_lang": "ne",
-            "source_file": path.name,
+            "direction": "en2ne",
+        }
+
+        # NE → EN  (reverse pair)
+        yield {
+            **base,
+            "source_text": ne_text,
+            "target_text": en_text,
+            "source_lang": "ne",
+            "target_lang": "en",
+            "direction": "ne2en",
         }
 
 
@@ -189,33 +234,44 @@ def load_examples(data_dir: Path) -> List[Dict[str, Any]]:
 
 
 def deduplicate_examples(examples: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    """Deduplicate on (source_text, target_text, direction)."""
+    deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for example in examples:
         source_text = normalize_text(example.get("source_text", ""))
         target_text = normalize_text(example.get("target_text", ""))
-        key = (source_text, target_text)
+        direction = example.get("direction", "en2ne")
+
+        # Extra guard: reject pairs whose langs are not allowed
+        if not is_allowed_lang(example.get("source_lang", "en")):
+            continue
+        if not is_allowed_lang(example.get("target_lang", "ne")):
+            continue
+
+        key = (source_text, target_text, direction)
         deduped[key] = {
             **example,
             "source_text": source_text,
             "target_text": target_text,
-            "source_lang": "en",
-            "target_lang": "ne",
         }
     return list(deduped.values())
 
 
+# ── persistence ────────────────────────────────────────────────────────────────
+
 def save_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8") as fh:
         for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+
+# ── splitting ──────────────────────────────────────────────────────────────────
 
 def split_examples(
     rows: List[Dict[str, Any]],
     validation_split: float = 0.1,
     seed: int = 42,
-):
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not rows:
         return [], [], []
 
@@ -223,14 +279,28 @@ def split_examples(
     if ratio <= 0.0 or len(rows) < 10:
         return rows, [], []
 
-    shuffled = rows[:]
-    random.Random(seed).shuffle(shuffled)
-    valid_size = max(1, int(len(shuffled) * ratio))
-    if valid_size >= len(shuffled):
-        valid_size = max(1, len(shuffled) - 1)
+    rng = random.Random(seed)
 
-    valid_rows = shuffled[:valid_size]
-    train_rows = shuffled[valid_size:]
+    # Group by direction
+    by_direction: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        d = row.get("direction", "en2ne")
+        by_direction.setdefault(d, []).append(row)
+
+    train_rows: List[Dict[str, Any]] = []
+    valid_rows: List[Dict[str, Any]] = []
+
+    for direction_rows in by_direction.values():
+        shuffled = direction_rows[:]
+        rng.shuffle(shuffled)
+        valid_size = max(1, int(len(shuffled) * ratio))
+        if valid_size >= len(shuffled):
+            valid_size = max(1, len(shuffled) - 1)
+        valid_rows.extend(shuffled[:valid_size])
+        train_rows.extend(shuffled[valid_size:])
+
+    rng.shuffle(train_rows)
+    rng.shuffle(valid_rows)
     return train_rows, valid_rows, []
 
 
@@ -242,15 +312,6 @@ def tokenize_examples(
     max_source_length: int,
     max_target_length: int,
 ) -> Dict[str, Any]:
-    """Tokenise a batch for NLLB without using the removed as_target_tokenizer()
-    or the unreliable text_target= kwarg.
-
-    Modern approach (Transformers >= 4.35):
-      - Encode the source with tokenizer.src_lang = <source_lang_code>
-      - Encode the target by temporarily setting tokenizer.src_lang =
-        <target_lang_code>, which makes the tokenizer prepend the correct
-        language-ID token for the decoder.
-    """
     input_ids_list: List[List[int]] = []
     attention_mask_list: List[List[int]] = []
     labels_list: List[List[int]] = []
@@ -261,19 +322,18 @@ def tokenize_examples(
         batch["source_lang"],
         batch["target_lang"],
     ):
-        src_code = ensure_lang_code(source_lang)   # e.g. "eng_Latn"
-        tgt_code = ensure_lang_code(target_lang)   # e.g. "npi_Deva"
+        src_code = ensure_lang_code(source_lang)
+        tgt_code = ensure_lang_code(target_lang)
 
-        # encode source
+        # Encode source
         tokenizer.src_lang = src_code
         enc = tokenizer(source_text, truncation=True, max_length=max_source_length)
 
-        # encode target: swap src_lang so the tokenizer prepends the target
-        # language-ID token (required by NLLB's sentencepiece vocabulary)
+        # Encode target with target-language BOS prepended
         tokenizer.src_lang = tgt_code
         lbl = tokenizer(target_text, truncation=True, max_length=max_target_length)
 
-        # restore (keeps state predictable for the next sample)
+        # Restore to source lang for next sample
         tokenizer.src_lang = src_code
 
         input_ids_list.append(enc["input_ids"])
@@ -281,19 +341,15 @@ def tokenize_examples(
         labels_list.append(lbl["input_ids"])
 
     return {
-        "input_ids":      input_ids_list,
+        "input_ids": input_ids_list,
         "attention_mask": attention_mask_list,
-        "labels":         labels_list,
+        "labels": labels_list,
     }
 
 
 class _TokenizeFn:
-    """Picklable callable for Dataset.map() worker processes.
-
-    A lambda that closes over a tokenizer cannot be pickled by multiprocess
-    on Windows, causing the worker pool to crash silently.  This named class
-    is always picklable.  The tokenizer is lazy-loaded inside each worker
-    from name_or_path so the heavy object is never serialised.
+    """
+    Picklable callable for Dataset.map() worker processes.
     """
 
     def __init__(
@@ -305,7 +361,7 @@ class _TokenizeFn:
         self.tokenizer_path = tokenizer_path
         self.max_source_length = max_source_length
         self.max_target_length = max_target_length
-        self._tokenizer = None   # lazy, populated inside each worker
+        self._tokenizer = None
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
@@ -330,19 +386,21 @@ def build_datasets(
     max_target_length: int,
     validation_split: float = 0.1,
     seed: int = 42,
-) -> Tuple[Dataset, Optional[Dataset]]:
-    train_rows, valid_rows, test_rows = split_examples(
-        rows,
-        validation_split=validation_split,
-        seed=seed,
+) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
+    """
+    Split, save, tokenise.
+
+    Returns (train_tokenized, valid_tokenized, valid_raw).
+    """
+    train_rows, valid_rows, _ = split_examples(
+        rows, validation_split=validation_split, seed=seed
     )
+
     data_dir = PROJECT_ROOT / "data" / "processed"
     save_jsonl(data_dir / "train.jsonl", train_rows)
     save_jsonl(data_dir / "valid.jsonl", valid_rows)
-    save_jsonl(data_dir / "test.jsonl", test_rows)
     save_jsonl(data_dir / "prepared_corpus.jsonl", rows)
 
-    # tokenizer.name_or_path is set by from_pretrained() — safe to pass to workers
     tok_path: str = getattr(tokenizer, "name_or_path", None) or DEFAULT_BASE_MODEL
     tok_fn = _TokenizeFn(tok_path, max_source_length, max_target_length)
 
@@ -353,25 +411,159 @@ def build_datasets(
         remove_columns=train_dataset.column_names,
     )
 
-    valid_tokenized = None
+    valid_tokenized: Optional[Dataset] = None
+    valid_raw: Optional[Dataset] = None
+
     if valid_rows:
-        valid_dataset = Dataset.from_list(valid_rows)
-        valid_tokenized = valid_dataset.map(
+        valid_raw = Dataset.from_list(valid_rows)
+        valid_tokenized = valid_raw.map(
             tok_fn,
             batched=True,
-            remove_columns=valid_dataset.column_names,
+            remove_columns=valid_raw.column_names,
         )
 
-    return train_tokenized, valid_tokenized
+    return train_tokenized, valid_tokenized, valid_raw
 
+
+# ── metrics ────────────────────────────────────────────────────────────────────
+
+def _safe_bleu(hypotheses: List[str], references: List[str]) -> float:
+    if not hypotheses or not references:
+        return 0.0
+    try:
+        return sacrebleu.corpus_bleu(hypotheses, [references]).score
+    except Exception:
+        return 0.0
+
+
+def make_compute_metrics(tokenizer, valid_raw: Optional[Dataset]):
+    def compute_metrics(eval_pred) -> Dict[str, float]:
+        predictions, labels = eval_pred
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+
+        # Decode predictions
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+
+        # Replace -100 (padding sentinel) before decoding labels
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        n = max(len(decoded_labels), 1)
+
+        # ── overall metrics ────────────────────────────────────────────────
+        exact_matches = sum(
+            1 for p, r in zip(decoded_preds, decoded_labels)
+            if p.strip() == r.strip()
+        )
+        token_overlap_total = 0.0
+        for pred, ref in zip(decoded_preds, decoded_labels):
+            ref_tokens = set(ref.split())
+            pred_tokens = set(pred.split())
+            if ref_tokens:
+                token_overlap_total += len(ref_tokens & pred_tokens) / len(ref_tokens)
+
+        overall_bleu = _safe_bleu(decoded_preds, decoded_labels)
+
+        results: Dict[str, float] = {
+            "bleu": overall_bleu,
+            "exact_match": exact_matches / n,
+            "token_overlap": token_overlap_total / n,
+        }
+
+        # ── per-direction metrics ──────────────────────────────────────────
+        if valid_raw is not None and len(valid_raw) == len(decoded_preds):
+            directions = valid_raw["direction"]
+
+            for tag in ("en2ne", "ne2en"):
+                indices = [i for i, d in enumerate(directions) if d == tag]
+                if not indices:
+                    results[f"bleu_{tag}"] = 0.0
+                    results[f"token_overlap_{tag}"] = 0.0
+                    continue
+
+                sub_preds = [decoded_preds[i] for i in indices]
+                sub_refs = [decoded_labels[i] for i in indices]
+
+                sub_bleu = _safe_bleu(sub_preds, sub_refs)
+
+                sub_overlap = 0.0
+                for p, r in zip(sub_preds, sub_refs):
+                    ref_tokens = set(r.split())
+                    pred_tokens = set(p.split())
+                    if ref_tokens:
+                        sub_overlap += len(ref_tokens & pred_tokens) / len(ref_tokens)
+
+                results[f"bleu_{tag}"] = sub_bleu
+                results[f"token_overlap_{tag}"] = sub_overlap / max(len(indices), 1)
+
+                print(
+                    f"  [{tag}] n={len(indices):4d}  "
+                    f"BLEU={sub_bleu:.2f}  "
+                    f"tok_overlap={results[f'token_overlap_{tag}']:.4f}"
+                )
+
+        return results
+
+    return compute_metrics
+
+
+# ── trainer subclass ───────────────────────────────────────────────────────────
+
+class NLLBSeq2SeqTrainer(Seq2SeqTrainer):
+    """
+    Defensive trainer for NLLB/M2M models.
+
+    - Removes decoder_inputs_embeds when decoder_input_ids is present.
+    - Calls model(**filtered_inputs) directly to compute loss to avoid
+      Trainer internals that may reintroduce problematic kwargs.
+    """
+
+    def _strip_decoder_inputs_embeds(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(inputs, dict):
+            return inputs
+        if "decoder_input_ids" in inputs and "decoder_inputs_embeds" in inputs:
+            return {k: v for k, v in inputs.items() if k != "decoder_inputs_embeds"}
+        return inputs
+
+    def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
+        # Defensive copy / strip
+        filtered_inputs = self._strip_decoder_inputs_embeds(dict(inputs))
+
+        # Ensure tensors are on the correct device (Trainer normally handles this)
+        # but model(**filtered_inputs) will accept them as-is since Trainer moved them.
+        outputs = model(**filtered_inputs)
+
+        # Prefer outputs.loss if available, else assume first element is loss
+        loss = getattr(outputs, "loss", None)
+        if loss is None:
+            if isinstance(outputs, tuple) and len(outputs) > 0:
+                loss = outputs[0]
+            else:
+                raise ValueError("Model did not return a loss in outputs")
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        # Strip problematic key(s) before any Trainer logic
+        inputs = self._strip_decoder_inputs_embeds(dict(inputs))
+        # Forward to Trainer.training_step which will call our compute_loss
+        return super().training_step(model, inputs, *args, **kwargs)
+
+
+# ── training ───────────────────────────────────────────────────────────────────
 
 def train_model(
     train_tokenized: Dataset,
     valid_tokenized: Optional[Dataset],
+    valid_raw: Optional[Dataset],
     config: Dict[str, Any],
     output_dir: Path,
 ) -> Dict[str, Any]:
     training_cfg = config.get("training", {})
+
     base_model              = str(training_cfg.get("base_model", DEFAULT_BASE_MODEL))
     cpu_threads             = int(training_cfg.get("cpu_threads", 12))
     grad_accum              = int(training_cfg.get("gradient_accumulation_steps", 2))
@@ -385,13 +577,12 @@ def train_model(
     per_device_batch        = int(training_cfg.get("batch_size", 8))
     logging_steps           = int(training_cfg.get("logging_steps", 20))
     dataloader_workers      = int(training_cfg.get("dataloader_workers", 0))
-    label_smoothing_factor  = float(training_cfg.get("label_smoothing_factor", 0.0))
+    label_smoothing_factor  = float(training_cfg.get("label_smoothing_factor", 0.1))
 
     torch.set_num_threads(cpu_threads)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32        = True
-        # enable cudnn benchmark for potentially faster kernels on fixed-size inputs
+        torch.backends.cudnn.allow_tf32 = True
         try:
             torch.backends.cudnn.benchmark = True
         except Exception:
@@ -399,60 +590,27 @@ def train_model(
 
     print(f"Loading base model: {base_model}")
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=False)
-    model     = AutoModelForSeq2SeqLM.from_pretrained(base_model, use_safetensors=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(base_model, use_safetensors=True)
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
-    # forced_bos_token_id should live in generation_config on newer
-    # Transformers versions; keeping it in model.config can break saving.
-    # NllbTokenizer uses convert_tokens_to_ids — lang_code_to_id does not exist.
-    tgt_code      = canonical_lang_code("ne")   # "npi_Deva"
-    forced_bos_id = tokenizer.convert_tokens_to_ids(tgt_code)
-    # convert_tokens_to_ids returns unk_token_id when the token is missing;
-    # only apply the override when we resolved a real token.
-    if forced_bos_id != tokenizer.unk_token_id:
-        if getattr(model, "generation_config", None) is not None:
-            model.generation_config.forced_bos_token_id = forced_bos_id
-        if hasattr(model.config, "forced_bos_token_id"):
-            model.config.forced_bos_token_id = None
-    else:
-        print(f"Warning: could not resolve forced_bos_token_id for '{tgt_code}'; "
-              "generation may not produce the correct target language.")
+    # Clear forced_bos_token_id because we use tokenizer.src_lang trick for labels
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.forced_bos_token_id = None
+    if hasattr(model.config, "forced_bos_token_id"):
+        model.config.forced_bos_token_id = None
 
     has_validation = valid_tokenized is not None and len(valid_tokenized) > 0
 
-    def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-
-        decoded_predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        exact_matches = 0
-        token_overlap_total = 0.0
-        for prediction, reference in zip(decoded_predictions, decoded_labels):
-            if prediction.strip() == reference.strip():
-                exact_matches += 1
-
-            reference_tokens = set(reference.split())
-            prediction_tokens = set(prediction.split())
-            if reference_tokens:
-                token_overlap_total += len(reference_tokens & prediction_tokens) / len(reference_tokens)
-
-        sample_count = max(1, len(decoded_labels))
-        bleu_score = sacrebleu.corpus_bleu(decoded_predictions, [decoded_labels]).score if decoded_labels else 0.0
-        return {
-            "exact_match_accuracy": exact_matches / sample_count,
-            "token_overlap_accuracy": token_overlap_total / sample_count,
-            "bleu": bleu_score,
-        }
+    compute_metrics = (
+        make_compute_metrics(tokenizer, valid_raw) if has_validation else None
+    )
 
     try:
         train_samples = len(train_tokenized)
     except Exception:
         train_samples = 0
+
     steps_per_epoch   = max(1, train_samples // (per_device_batch * max(1, grad_accum)))
     total_train_steps = steps_per_epoch * max(1, num_train_epochs)
     warmup_steps      = int(total_train_steps * warmup_ratio)
@@ -473,29 +631,26 @@ def train_model(
         logging_steps=logging_steps,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=torch.cuda.is_available(),
-        # This model fails when Trainer strips labels and runs an unlabeled
-        # forward pass, so keep the model's built-in seq2seq loss path.
-        label_smoothing_factor=0.0,
+        label_smoothing_factor=label_smoothing_factor,
         predict_with_generate=True,
         generation_max_length=max_target_length,
         load_best_model_at_end=has_validation,
-        metric_for_best_model="token_overlap_accuracy" if has_validation else None,
-        greater_is_better=has_validation,
-        fp16=torch.cuda.is_available(),
-        gradient_checkpointing=True,
+        metric_for_best_model="bleu" if has_validation else None,
+        greater_is_better=True if has_validation else None,
+        fp16=bool(training_cfg.get("fp16", torch.cuda.is_available())),
+        gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", True)),
         report_to="none",
         save_total_limit=save_total_limit,
+        # include_inputs_for_metrics removed — dropped in Transformers 4.38+
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = NLLBSeq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_tokenized,
         eval_dataset=valid_tokenized if has_validation else None,
-        # Avoid injecting decoder_input_ids in the collator; this prevents
-        # decoder_input_ids/decoder_inputs_embeds conflicts in some builds.
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        compute_metrics=compute_metrics if has_validation else None,
+        compute_metrics=compute_metrics,
         callbacks=(
             [EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
             if has_validation else []
@@ -504,12 +659,14 @@ def train_model(
 
     print(f"Training samples  : {len(train_tokenized)}")
     print(f"Validation samples: {len(valid_tokenized) if has_validation else 0}")
-    print(f"CPU threads: {cpu_threads} | Grad accumulation: {grad_accum}")
+    print(f"CPU threads: {cpu_threads}  |  Grad accumulation: {grad_accum}")
     print(f"GPU available: {torch.cuda.is_available()}")
-    print(f"Steps/epoch: {steps_per_epoch} | Total steps: {total_train_steps}")
+    print(f"Steps/epoch: {steps_per_epoch}  |  Total steps: {total_train_steps}")
+    print(f"Label smoothing: {label_smoothing_factor}")
     if has_validation:
-        print("Validation metrics are computed at the end of every epoch.")
-    print(f"Starting fine-tuning for {num_train_epochs} epochs ...")
+        print("Validation (BLEU + per-direction breakdown) computed each epoch.")
+    print(f"Starting fine-tuning for {num_train_epochs} epochs …")
+
     trainer.train()
 
     print(f"Saving trained model to {output_dir}")
@@ -517,21 +674,24 @@ def train_model(
     tokenizer.save_pretrained(str(output_dir))
 
     summary = {
-        "base_model":       base_model,
-        "output_dir":       str(output_dir),
-        "train_examples":   len(train_tokenized),
-        "valid_examples":   len(valid_tokenized) if has_validation else 0,
+        "base_model": base_model,
+        "output_dir": str(output_dir),
+        "train_examples": len(train_tokenized),
+        "valid_examples": len(valid_tokenized) if has_validation else 0,
         "max_target_length": max_target_length,
-        "gpu_available":    torch.cuda.is_available(),
+        "gpu_available": torch.cuda.is_available(),
+        "directions": ["en2ne", "ne2en"],
     }
-    with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    with (output_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False, indent=2)
     return summary
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a translation model from local CSV/TSV data."
+        description="Fine-tune NLLB for bidirectional EN↔NE translation."
     )
     parser.add_argument("--config",       default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--data-dir",     default=None)
@@ -544,13 +704,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_arg_parser()
-    args   = parser.parse_args()
+    args = parser.parse_args()
     set_seed(args.seed)
 
-    config       = load_config(Path(args.config))
-    data_cfg     = config.get("data", {})
+    config = load_config(Path(args.config))
+    data_cfg = config.get("data", {})
     training_cfg = config.get("training", {})
-    print(PROJECT_ROOT)
+
+    print(f"Project root: {PROJECT_ROOT}")
+
     data_dir = resolve_project_path(
         args.data_dir or data_cfg.get("data_dir"),
         DEFAULT_DATA_DIR,
@@ -570,14 +732,20 @@ def main() -> None:
     examples = load_examples(data_dir)
     examples = deduplicate_examples(examples)
     if not examples:
-        raise RuntimeError(f"No usable translation pairs found in {data_dir}")
+        raise RuntimeError(f"No usable EN/NE translation pairs found in {data_dir}")
 
     random.Random(args.seed).shuffle(examples)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Loaded {len(examples)} usable pairs from {data_dir}")
+
+    en2ne_count = sum(1 for e in examples if e.get("direction") == "en2ne")
+    ne2en_count = sum(1 for e in examples if e.get("direction") == "ne2en")
+    print(
+        f"Loaded {len(examples)} usable pairs from {data_dir}  "
+        f"(EN→NE: {en2ne_count}, NE→EN: {ne2en_count})"
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=False)
-    train_tokenized, valid_tokenized = build_datasets(
+    train_tokenized, valid_tokenized, valid_raw = build_datasets(
         examples,
         tokenizer,
         max_source_length=max_source_length,
@@ -587,25 +755,32 @@ def main() -> None:
     )
 
     prepared_summary = {
-        "data_dir":     str(data_dir),
-        "output_dir":   str(output_dir),
+        "data_dir": str(data_dir),
+        "output_dir": str(output_dir),
         "example_count": len(examples),
-        "file_count":   len(list(iter_tabular_files(data_dir))),
+        "en2ne_count": en2ne_count,
+        "ne2en_count": ne2en_count,
+        "file_count": len(list(iter_tabular_files(data_dir))),
     }
-    with (output_dir / "dataset_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(prepared_summary, handle, ensure_ascii=False, indent=2)
+    with (output_dir / "dataset_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(prepared_summary, fh, ensure_ascii=False, indent=2)
     print(json.dumps(prepared_summary, ensure_ascii=False, indent=2))
 
     if args.prepare_only:
-        print("Preparation complete. Skipping training because --prepare-only was set.")
+        print("Preparation complete. Skipping training (--prepare-only).")
         return
 
-    summary = train_model(train_tokenized, valid_tokenized, config, output_dir)
+    summary = train_model(
+        train_tokenized, valid_tokenized, valid_raw, config, output_dir
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
+    print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        print(torch.cuda.get_device_name(0))
+        try:
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
     main()
