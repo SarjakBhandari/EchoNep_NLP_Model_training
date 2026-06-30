@@ -32,7 +32,7 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "checkpoints" / "translation_model"
 DEFAULT_BASE_MODEL = str(PROJECT_ROOT / "models" / "nllb")
 
-# ── language helpers ───────────────────────────────────────────────────────────
+# -- language helpers -----------------------------------------------------------
 
 LANGUAGE_MAP = {
     "en": "eng_Latn",
@@ -58,7 +58,7 @@ DEVANAGARI_PATTERN = re.compile(r"[\u0900-\u097F]")
 LATIN_PATTERN = re.compile(r"[A-Za-z]")
 
 
-# ── config ─────────────────────────────────────────────────────────────────────
+# -- config ---------------------------------------------------------------------
 
 def load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -73,7 +73,7 @@ def resolve_project_path(value: Any, default: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-# ── text utilities ─────────────────────────────────────────────────────────────
+# -- text utilities -------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
     value = unicodedata.normalize("NFKC", str(text))
@@ -96,7 +96,7 @@ def guess_language(text: str) -> Optional[str]:
         return "ne"
     if latin >= max(devanagari * 2, 2):
         return "en"
-    return None  # mixed / ambiguous — reject
+    return None  # mixed / ambiguous - reject
 
 
 def canonical_lang_code(lang: str) -> str:
@@ -111,7 +111,7 @@ def is_allowed_lang(code: str) -> bool:
     return canonical_lang_code(code) in ALLOWED_NLLB_CODES
 
 
-# ── file discovery ─────────────────────────────────────────────────────────────
+# -- file discovery -------------------------------------------------------------
 
 def iter_tabular_files(data_dir: Path, include_hidden: bool = False) -> Iterator[Path]:
     excluded_dirs = {"external", "processed", "raw", "checkpoints", "venv", ".git"}
@@ -157,7 +157,7 @@ def choose_header_columns(header: Sequence[str]) -> Tuple[int, int]:
     return source_index, target_index
 
 
-# ── data loading ───────────────────────────────────────────────────────────────
+# -- data loading ---------------------------------------------------------------
 
 def read_tabular_file(path: Path) -> Iterable[Dict[str, Any]]:
     """
@@ -205,7 +205,7 @@ def read_tabular_file(path: Path) -> Iterable[Dict[str, Any]]:
 
         base = {"source_file": path.name}
 
-        # EN → NE
+        # EN -> NE
         yield {
             **base,
             "source_text": en_text,
@@ -215,7 +215,7 @@ def read_tabular_file(path: Path) -> Iterable[Dict[str, Any]]:
             "direction": "en2ne",
         }
 
-        # NE → EN  (reverse pair)
+        # NE -> EN  (reverse pair)
         yield {
             **base,
             "source_text": ne_text,
@@ -256,7 +256,7 @@ def deduplicate_examples(examples: Iterable[Dict[str, Any]]) -> List[Dict[str, A
     return list(deduped.values())
 
 
-# ── persistence ────────────────────────────────────────────────────────────────
+# -- persistence ----------------------------------------------------------------
 
 def save_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +265,7 @@ def save_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-# ── splitting ──────────────────────────────────────────────────────────────────
+# -- splitting ------------------------------------------------------------------
 
 def split_examples(
     rows: List[Dict[str, Any]],
@@ -304,7 +304,7 @@ def split_examples(
     return train_rows, valid_rows, []
 
 
-# ── tokenisation ───────────────────────────────────────────────────────────────
+# -- tokenisation ---------------------------------------------------------------
 
 def tokenize_examples(
     batch: Dict[str, List[str]],
@@ -425,7 +425,7 @@ def build_datasets(
     return train_tokenized, valid_tokenized, valid_raw
 
 
-# ── metrics ────────────────────────────────────────────────────────────────────
+# -- metrics --------------------------------------------------------------------
 
 def _safe_bleu(hypotheses: List[str], references: List[str]) -> float:
     if not hypotheses or not references:
@@ -451,7 +451,7 @@ def make_compute_metrics(tokenizer, valid_raw: Optional[Dataset]):
 
         n = max(len(decoded_labels), 1)
 
-        # ── overall metrics ────────────────────────────────────────────────
+        # -- overall metrics ------------------------------------------------
         exact_matches = sum(
             1 for p, r in zip(decoded_preds, decoded_labels)
             if p.strip() == r.strip()
@@ -471,7 +471,7 @@ def make_compute_metrics(tokenizer, valid_raw: Optional[Dataset]):
             "token_overlap": token_overlap_total / n,
         }
 
-        # ── per-direction metrics ──────────────────────────────────────────
+        # -- per-direction metrics ------------------------------------------
         if valid_raw is not None and len(valid_raw) == len(decoded_preds):
             directions = valid_raw["direction"]
 
@@ -508,7 +508,7 @@ def make_compute_metrics(tokenizer, valid_raw: Optional[Dataset]):
     return compute_metrics
 
 
-# ── trainer subclass ───────────────────────────────────────────────────────────
+# -- trainer subclass -----------------------------------------------------------
 
 class NLLBSeq2SeqTrainer(Seq2SeqTrainer):
     """
@@ -553,7 +553,7 @@ class NLLBSeq2SeqTrainer(Seq2SeqTrainer):
         return super().training_step(model, inputs, *args, **kwargs)
 
 
-# ── training ───────────────────────────────────────────────────────────────────
+# -- training -------------------------------------------------------------------
 
 def train_model(
     train_tokenized: Dataset,
@@ -641,7 +641,7 @@ def train_model(
         gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", True)),
         report_to="none",
         save_total_limit=save_total_limit,
-        # include_inputs_for_metrics removed — dropped in Transformers 4.38+
+        # include_inputs_for_metrics removed - dropped in Transformers 4.38+
     )
 
     trainer = NLLBSeq2SeqTrainer(
@@ -665,7 +665,7 @@ def train_model(
     print(f"Label smoothing: {label_smoothing_factor}")
     if has_validation:
         print("Validation (BLEU + per-direction breakdown) computed each epoch.")
-    print(f"Starting fine-tuning for {num_train_epochs} epochs …")
+    print(f"Starting fine-tuning for {num_train_epochs} epochs...")
 
     trainer.train()
 
@@ -687,11 +687,11 @@ def train_model(
     return summary
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# -- CLI -------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fine-tune NLLB for bidirectional EN↔NE translation."
+        description="Fine-tune NLLB for bidirectional EN<->NE translation."
     )
     parser.add_argument("--config",       default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--data-dir",     default=None)
@@ -741,7 +741,7 @@ def main() -> None:
     ne2en_count = sum(1 for e in examples if e.get("direction") == "ne2en")
     print(
         f"Loaded {len(examples)} usable pairs from {data_dir}  "
-        f"(EN→NE: {en2ne_count}, NE→EN: {ne2en_count})"
+        f"(EN->NE: {en2ne_count}, NE->EN: {ne2en_count})"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=False)
